@@ -29,6 +29,9 @@ import tokenization
 import six
 import tensorflow as tf
 
+import logging
+from websocket_server import WebsocketServer
+
 flags = tf.flags
 
 FLAGS = flags.FLAGS
@@ -224,10 +227,15 @@ class InputFeatures(object):
     self.is_impossible = is_impossible
 
 
-def read_squad_examples(input_file, is_training):
+def read_squad_examples(input_file, input_string, is_training):
   """Read a SQuAD json file into a list of SquadExample."""
-  with tf.gfile.Open(input_file, "r") as reader:
-    input_data = json.load(reader)["data"]
+
+  if input_file is not None:
+      with tf.gfile.Open(input_file, "r") as reader:
+        input_data = json.load(reader)["data"]
+
+  if input_string is not None:
+      input_data = json.loads(input_string)["data"]
 
   def is_whitespace(c):
     if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F:
@@ -923,6 +931,11 @@ def write_predictions(all_examples, all_features, all_results, n_best_size,
     with tf.gfile.GFile(output_null_log_odds_file, "w") as writer:
       writer.write(json.dumps(scores_diff_json, indent=4) + "\n")
 
+  answer = ""
+  for key, value in all_predictions.items():
+      answer = value
+
+  return answer
 
 def get_final_text(pred_text, orig_text, do_lower_case):
   """Project the tokenized prediction back to the original text."""
@@ -1123,6 +1136,91 @@ def validate_flags_or_throw(bert_config):
         "(%d) + 3" % (FLAGS.max_seq_length, FLAGS.max_query_length))
 
 
+class Predictor:
+    def __init__(self,
+                 tokenizer,
+                 estimator):
+        self._tokenizer = tokenizer
+        self._estimator = estimator
+
+    def predict_answer(self, json_squad_data):
+        eval_examples = read_squad_examples(
+            input_file=None, input_string=json_squad_data, is_training=False)
+
+        eval_writer = FeatureWriter(
+            filename=os.path.join(FLAGS.output_dir, "eval.tf_record"),
+            is_training=False)
+        eval_features = []
+
+        def append_feature(feature):
+            eval_features.append(feature)
+            eval_writer.process_feature(feature)
+
+        convert_examples_to_features(
+            examples=eval_examples,
+            tokenizer=self._tokenizer,
+            max_seq_length=FLAGS.max_seq_length,
+            doc_stride=FLAGS.doc_stride,
+            max_query_length=FLAGS.max_query_length,
+            is_training=False,
+            output_fn=append_feature)
+        eval_writer.close()
+
+        tf.logging.info("***** Running predictions *****")
+        tf.logging.info("  Num orig examples = %d", len(eval_examples))
+        tf.logging.info("  Num split examples = %d", len(eval_features))
+        tf.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
+
+        all_results = []
+
+        predict_input_fn = input_fn_builder(
+            input_file=eval_writer.filename,
+            seq_length=FLAGS.max_seq_length,
+            is_training=False,
+            drop_remainder=False)
+
+        # If running eval on the TPU, you will need to specify the number of
+        # steps.
+        all_results = []
+        for result in self._estimator.predict(
+                predict_input_fn, yield_single_examples=True):
+            if len(all_results) % 1000 == 0:
+                tf.logging.info("Processing example: %d" % (len(all_results)))
+            unique_id = int(result["unique_ids"])
+            start_logits = [float(x) for x in result["start_logits"].flat]
+            end_logits = [float(x) for x in result["end_logits"].flat]
+            all_results.append(
+                RawResult(
+                    unique_id=unique_id,
+                    start_logits=start_logits,
+                    end_logits=end_logits))
+
+        output_prediction_file = os.path.join(FLAGS.output_dir, "predictions.json")
+        output_nbest_file = os.path.join(FLAGS.output_dir, "nbest_predictions.json")
+        output_null_log_odds_file = os.path.join(FLAGS.output_dir, "null_odds.json")
+
+        answer = write_predictions(eval_examples, eval_features, all_results,
+                          FLAGS.n_best_size, FLAGS.max_answer_length,
+                          FLAGS.do_lower_case, output_prediction_file,
+                          output_nbest_file, output_null_log_odds_file)
+
+        return answer
+
+
+    def new_client(self, client, server):
+        server.send_message_to_all("Hey all, a new client has joined us")
+
+    def message_recieved(self, client, server, message):
+        print("received message from client {}: {}".format(client, message))
+        answer = self.predict_answer(message)
+        server.send_message(client, answer)
+
+    def start_web_server(self):
+        server = WebsocketServer(13254, host='127.0.0.1', loglevel=logging.INFO)
+        server.set_fn_new_client(self.new_client)
+        server.set_fn_message_received(self.message_recieved)
+        server.run_forever()
+
 def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
 
@@ -1156,7 +1254,7 @@ def main(_):
   num_warmup_steps = None
   if FLAGS.do_train:
     train_examples = read_squad_examples(
-        input_file=FLAGS.train_file, is_training=True)
+        input_file=FLAGS.train_file, input_string=None, is_training=True)
     num_train_steps = int(
         len(train_examples) / FLAGS.train_batch_size * FLAGS.num_train_epochs)
     num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
@@ -1215,8 +1313,11 @@ def main(_):
     estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
 
   if FLAGS.do_predict:
+    predictor_server = Predictor(tokenizer, estimator)
+    predictor_server.start_web_server()
+
     eval_examples = read_squad_examples(
-        input_file=FLAGS.predict_file, is_training=False)
+        input_file=FLAGS.predict_file, input_string=None, is_training=False)
 
     eval_writer = FeatureWriter(
         filename=os.path.join(FLAGS.output_dir, "eval.tf_record"),
