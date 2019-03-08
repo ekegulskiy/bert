@@ -1208,7 +1208,8 @@ class Predictor:
 
 
     def new_client(self, client, server):
-        server.send_message_to_all("Hey all, a new client has joined us")
+        # server.send_message_to_all("Hey all, a new client has joined us")
+        print("new client has joined")
 
     def message_recieved(self, client, server, message):
         print("received message from client {}: {}".format(client, message))
