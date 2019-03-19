@@ -28,9 +28,9 @@ import optimization
 import tokenization
 import six
 import tensorflow as tf
-
-import logging
-from websocket_server import WebsocketServer
+import qa_service
+import threading
+from queue import Queue
 
 flags = tf.flags
 
@@ -1142,39 +1142,261 @@ class Predictor:
                  estimator):
         self._tokenizer = tokenizer
         self._estimator = estimator
+        self._q = Queue()
+        self._evt = None
+        self._qa_srv = qa_service.QAService(self._q)
+        self._eval_example = None
+        self._eval_features = None
 
-    def predict_answer(self, json_squad_data):
-        eval_examples = read_squad_examples(
-            input_file=None, input_string=json_squad_data, is_training=False)
+    def get_predictions(self, all_examples, all_features, all_results, n_best_size,
+                          max_answer_length, do_lower_case):
 
-        eval_writer = FeatureWriter(
-            filename=os.path.join(FLAGS.output_dir, "eval.tf_record"),
-            is_training=False)
-        eval_features = []
+        example_index_to_features = collections.defaultdict(list)
+        for feature in all_features:
+            example_index_to_features[feature.example_index].append(feature)
 
-        def append_feature(feature):
-            eval_features.append(feature)
-            eval_writer.process_feature(feature)
+        unique_id_to_result = {}
+        for result in all_results:
+            unique_id_to_result[result.unique_id] = result
 
-        convert_examples_to_features(
-            examples=eval_examples,
-            tokenizer=self._tokenizer,
-            max_seq_length=FLAGS.max_seq_length,
-            doc_stride=FLAGS.doc_stride,
-            max_query_length=FLAGS.max_query_length,
-            is_training=False,
-            output_fn=append_feature)
-        eval_writer.close()
+        _PrelimPrediction = collections.namedtuple(  # pylint: disable=invalid-name
+            "PrelimPrediction",
+            ["feature_index", "start_index", "end_index", "start_logit", "end_logit"])
 
-        tf.logging.info("***** Running predictions *****")
-        tf.logging.info("  Num orig examples = %d", len(eval_examples))
-        tf.logging.info("  Num split examples = %d", len(eval_features))
-        tf.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
+        all_predictions = collections.OrderedDict()
+        all_nbest_json = collections.OrderedDict()
+        scores_diff_json = collections.OrderedDict()
+
+        for (example_index, example) in enumerate(all_examples):
+            features = example_index_to_features[example_index]
+
+            prelim_predictions = []
+            # keep track of the minimum score of null start+end of position 0
+            score_null = 1000000  # large and positive
+            min_null_feature_index = 0  # the paragraph slice with min mull score
+            null_start_logit = 0  # the start logit at the slice with min null score
+            null_end_logit = 0  # the end logit at the slice with min null score
+            for (feature_index, feature) in enumerate(features):
+                result = unique_id_to_result[feature.unique_id]
+                start_indexes = _get_best_indexes(result.start_logits, n_best_size)
+                end_indexes = _get_best_indexes(result.end_logits, n_best_size)
+                # if we could have irrelevant answers, get the min score of irrelevant
+                if FLAGS.version_2_with_negative:
+                    feature_null_score = result.start_logits[0] + result.end_logits[0]
+                    if feature_null_score < score_null:
+                        score_null = feature_null_score
+                        min_null_feature_index = feature_index
+                        null_start_logit = result.start_logits[0]
+                        null_end_logit = result.end_logits[0]
+                for start_index in start_indexes:
+                    for end_index in end_indexes:
+                        # We could hypothetically create invalid predictions, e.g., predict
+                        # that the start of the span is in the question. We throw out all
+                        # invalid predictions.
+                        if start_index >= len(feature.tokens):
+                            continue
+                        if end_index >= len(feature.tokens):
+                            continue
+                        if start_index not in feature.token_to_orig_map:
+                            continue
+                        if end_index not in feature.token_to_orig_map:
+                            continue
+                        if not feature.token_is_max_context.get(start_index, False):
+                            continue
+                        if end_index < start_index:
+                            continue
+                        length = end_index - start_index + 1
+                        if length > max_answer_length:
+                            continue
+                        prelim_predictions.append(
+                            _PrelimPrediction(
+                                feature_index=feature_index,
+                                start_index=start_index,
+                                end_index=end_index,
+                                start_logit=result.start_logits[start_index],
+                                end_logit=result.end_logits[end_index]))
+
+            if FLAGS.version_2_with_negative:
+                prelim_predictions.append(
+                    _PrelimPrediction(
+                        feature_index=min_null_feature_index,
+                        start_index=0,
+                        end_index=0,
+                        start_logit=null_start_logit,
+                        end_logit=null_end_logit))
+            prelim_predictions = sorted(
+                prelim_predictions,
+                key=lambda x: (x.start_logit + x.end_logit),
+                reverse=True)
+
+            _NbestPrediction = collections.namedtuple(  # pylint: disable=invalid-name
+                "NbestPrediction", ["text", "start_logit", "end_logit"])
+
+            seen_predictions = {}
+            nbest = []
+            for pred in prelim_predictions:
+                if len(nbest) >= n_best_size:
+                    break
+                feature = features[pred.feature_index]
+                if pred.start_index > 0:  # this is a non-null prediction
+                    tok_tokens = feature.tokens[pred.start_index:(pred.end_index + 1)]
+                    orig_doc_start = feature.token_to_orig_map[pred.start_index]
+                    orig_doc_end = feature.token_to_orig_map[pred.end_index]
+                    orig_tokens = example.doc_tokens[orig_doc_start:(orig_doc_end + 1)]
+                    tok_text = " ".join(tok_tokens)
+
+                    # De-tokenize WordPieces that have been split off.
+                    tok_text = tok_text.replace(" ##", "")
+                    tok_text = tok_text.replace("##", "")
+
+                    # Clean whitespace
+                    tok_text = tok_text.strip()
+                    tok_text = " ".join(tok_text.split())
+                    orig_text = " ".join(orig_tokens)
+
+                    final_text = get_final_text(tok_text, orig_text, do_lower_case)
+                    if final_text in seen_predictions:
+                        continue
+
+                    seen_predictions[final_text] = True
+                else:
+                    final_text = ""
+                    seen_predictions[final_text] = True
+
+                nbest.append(
+                    _NbestPrediction(
+                        text=final_text,
+                        start_logit=pred.start_logit,
+                        end_logit=pred.end_logit))
+
+            # if we didn't inlude the empty option in the n-best, inlcude it
+            if FLAGS.version_2_with_negative:
+                if "" not in seen_predictions:
+                    nbest.append(
+                        _NbestPrediction(
+                            text="", start_logit=null_start_logit,
+                            end_logit=null_end_logit))
+            # In very rare edge cases we could have no valid predictions. So we
+            # just create a nonce prediction in this case to avoid failure.
+            if not nbest:
+                nbest.append(
+                    _NbestPrediction(text="empty", start_logit=0.0, end_logit=0.0))
+
+            assert len(nbest) >= 1
+
+            total_scores = []
+            best_non_null_entry = None
+            for entry in nbest:
+                total_scores.append(entry.start_logit + entry.end_logit)
+                if not best_non_null_entry:
+                    if entry.text:
+                        best_non_null_entry = entry
+
+            probs = _compute_softmax(total_scores)
+
+            nbest_json = []
+            for (i, entry) in enumerate(nbest):
+                output = collections.OrderedDict()
+                output["text"] = entry.text
+                output["probability"] = probs[i]
+                output["start_logit"] = entry.start_logit
+                output["end_logit"] = entry.end_logit
+                nbest_json.append(output)
+
+            assert len(nbest_json) >= 1
+
+            if not FLAGS.version_2_with_negative:
+                all_predictions[example.qas_id] = nbest_json[0]["text"]
+            else:
+                # predict "" iff the null score - the score of best non-null > threshold
+                score_diff = score_null - best_non_null_entry.start_logit - (
+                    best_non_null_entry.end_logit)
+                scores_diff_json[example.qas_id] = score_diff
+                if score_diff > FLAGS.null_score_diff_threshold:
+                    all_predictions[example.qas_id] = ""
+                else:
+                    all_predictions[example.qas_id] = best_non_null_entry.text
+
+            all_nbest_json[example.qas_id] = nbest_json
+
+        answer = ""
+        for key, value in all_predictions.items():
+            answer = value
+
+        return answer
+
+    def input_fn_builder(self, input_file, seq_length, is_training, drop_remainder):
+        """Creates an `input_fn` closure to be passed to TPUEstimator."""
+
+        name_to_features = {
+            "unique_ids": tf.FixedLenFeature([], tf.int64),
+            "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
+            "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
+            "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
+        }
+
+        def gen():
+            eval_writer = FeatureWriter(
+                filename=os.path.join(FLAGS.output_dir, "eval.tf_record"),
+                is_training=False)
+
+            eval_writer.close()
+
+            while True:
+                json_squad_data, self._evt = self._q.get()
+
+                self._eval_example = read_squad_examples(
+                    input_file=None, input_string=json_squad_data, is_training=False)
+                self._eval_features = []
+
+                def append_feature(feature):
+                    self._eval_features.append(feature)
+                    #eval_writer.process_feature(feature)
+
+                convert_examples_to_features(
+                    examples=self._eval_example,
+                    tokenizer=self._tokenizer,
+                    max_seq_length=FLAGS.max_seq_length,
+                    doc_stride=FLAGS.doc_stride,
+                    max_query_length=FLAGS.max_query_length,
+                    is_training=False,
+                    output_fn=append_feature)
+
+                tf.logging.info("***** Running predictions *****")
+                tf.logging.info("  Num orig examples = %d", len(self._eval_example))
+                tf.logging.info("  Num split examples = %d", len(self._eval_features))
+                tf.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
+
+                yield {
+                    'unique_ids': [f.unique_id for f in self._eval_features],
+                    'input_ids': [f.input_ids for f in self._eval_features],
+                    'input_mask': [f.input_mask for f in self._eval_features],
+                    'segment_ids': [f.segment_ids for f in self._eval_features]
+                }
+
+        def input_fn(params):
+            if True:
+                return (tf.data.Dataset.from_generator(
+                    gen,
+                    output_types={'input_ids': tf.int32,
+                                  'input_mask': tf.int32,
+                                  'segment_ids': tf.int32,
+                                  'unique_ids': tf.int32},
+                    output_shapes={
+                        'unique_ids': (None),
+                        'input_ids': (None, None),
+                        'input_mask': (None, None),
+                        'segment_ids': (None, None)}).prefetch(None))
+
+        return input_fn
+
+    def run(self):
+        self._qa_srv.start_web_server()
 
         all_results = []
 
-        predict_input_fn = input_fn_builder(
-            input_file=eval_writer.filename,
+        predict_input_fn = self.input_fn_builder(
+            input_file=os.path.join(FLAGS.output_dir, "eval.tf_record"),
             seq_length=FLAGS.max_seq_length,
             is_training=False,
             drop_remainder=False)
@@ -1183,44 +1405,28 @@ class Predictor:
         # steps.
         all_results = []
         for result in self._estimator.predict(
-                predict_input_fn, yield_single_examples=True):
-            if len(all_results) % 1000 == 0:
-                tf.logging.info("Processing example: %d" % (len(all_results)))
-            unique_id = int(result["unique_ids"])
-            start_logits = [float(x) for x in result["start_logits"].flat]
-            end_logits = [float(x) for x in result["end_logits"].flat]
-            all_results.append(
-                RawResult(
-                    unique_id=unique_id,
-                    start_logits=start_logits,
-                    end_logits=end_logits))
+                predict_input_fn, yield_single_examples=False):
 
-        output_prediction_file = os.path.join(FLAGS.output_dir, "predictions.json")
-        output_nbest_file = os.path.join(FLAGS.output_dir, "nbest_predictions.json")
-        output_null_log_odds_file = os.path.join(FLAGS.output_dir, "null_odds.json")
+            for i in range(result["unique_ids"].size):
+                unique_id = int(result["unique_ids"][i])
+                start_logits = [float(x) for x in result["start_logits"][i].flat]
+                end_logits = [float(x) for x in result["end_logits"][i].flat]
+                all_results.append(
+                    RawResult(
+                        unique_id=unique_id,
+                        start_logits=start_logits,
+                        end_logits=end_logits))
 
-        answer = write_predictions(eval_examples, eval_features, all_results,
-                          FLAGS.n_best_size, FLAGS.max_answer_length,
-                          FLAGS.do_lower_case, output_prediction_file,
-                          output_nbest_file, output_null_log_odds_file)
+            answer = self.get_predictions(self._eval_example, self._eval_features, all_results,
+                              FLAGS.n_best_size, FLAGS.max_answer_length,
+                              FLAGS.do_lower_case)
+
+            self._qa_srv.set_answer(answer)
+            self._evt.set()
+            self._q.task_done()
 
         return answer
 
-
-    def new_client(self, client, server):
-        # server.send_message_to_all("Hey all, a new client has joined us")
-        print("new client has joined")
-
-    def message_recieved(self, client, server, message):
-        print("received message from client {}: {}".format(client, message))
-        answer = self.predict_answer(message)
-        server.send_message(client, answer)
-
-    def start_web_server(self):
-        server = WebsocketServer(13254, host='127.0.0.1', loglevel=logging.INFO)
-        server.set_fn_new_client(self.new_client)
-        server.set_fn_message_received(self.message_recieved)
-        server.run_forever()
 
 def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
@@ -1314,8 +1520,10 @@ def main(_):
     estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
 
   if FLAGS.do_predict:
-    predictor_server = Predictor(tokenizer, estimator)
-    predictor_server.start_web_server()
+    qa_predictor = Predictor(tokenizer, estimator)
+    qa_predictor.run()
+
+    exit(0)
 
     eval_examples = read_squad_examples(
         input_file=FLAGS.predict_file, input_string=None, is_training=False)
