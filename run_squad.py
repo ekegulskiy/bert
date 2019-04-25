@@ -22,6 +22,7 @@ import collections
 import json
 import math
 import os
+import sys
 import random
 import modeling
 import optimization
@@ -31,6 +32,7 @@ import tensorflow as tf
 import qa_service
 import threading
 from queue import Queue
+import logging
 
 flags = tf.flags
 
@@ -371,6 +373,11 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
         break
       start_offset += min(length, doc_stride)
 
+
+    # check for number of _DocSpan
+    #if len(doc_spans) > 1:
+    #    sys.exit("too many tokens for one example: {}".format(len(all_doc_tokens)))
+
     for (doc_span_index, doc_span) in enumerate(doc_spans):
       tokens = []
       token_to_orig_map = {}
@@ -442,15 +449,15 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
         tf.logging.info("doc_span_index: %s" % (doc_span_index))
         tf.logging.info("tokens: %s" % " ".join(
             [tokenization.printable_text(x) for x in tokens]))
-        tf.logging.info("token_to_orig_map: %s" % " ".join(
+        tf.logging.debug("token_to_orig_map: %s" % " ".join(
             ["%d:%d" % (x, y) for (x, y) in six.iteritems(token_to_orig_map)]))
-        tf.logging.info("token_is_max_context: %s" % " ".join([
+        tf.logging.debug("token_is_max_context: %s" % " ".join([
             "%d:%s" % (x, y) for (x, y) in six.iteritems(token_is_max_context)
         ]))
-        tf.logging.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
-        tf.logging.info(
+        tf.logging.debug("input_ids: %s" % " ".join([str(x) for x in input_ids]))
+        tf.logging.debug(
             "input_mask: %s" % " ".join([str(x) for x in input_mask]))
-        tf.logging.info(
+        tf.logging.debug(
             "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
         if is_training and example.is_impossible:
           tf.logging.info("impossible example")
@@ -1320,10 +1327,11 @@ class Predictor:
             all_nbest_json[example.qas_id] = nbest_json
 
         answer = ""
-        for key, value in all_predictions.items():
-            answer = value
+        #for key, value in all_predictions.items():
+        #    answer = value
 
-        return answer
+        json_data = json.dumps(nbest_json)
+        return json_data
 
     def input_fn_builder(self, input_file, seq_length, is_training, drop_remainder):
         """Creates an `input_fn` closure to be passed to TPUEstimator."""
@@ -1396,7 +1404,7 @@ class Predictor:
         all_results = []
 
         predict_input_fn = self.input_fn_builder(
-            input_file=os.path.join(FLAGS.output_dir, "eval.tf_record"),
+            input_file=os.path.join(os.path.expandvars(FLAGS.output_dir), "eval.tf_record"),
             seq_length=FLAGS.max_seq_length,
             is_training=False,
             drop_remainder=False)
@@ -1429,16 +1437,19 @@ class Predictor:
 
 
 def main(_):
+  # turn off root handlers sinct ts.logging has its own logging handler
+  logging.root.handlers = []
+
   tf.logging.set_verbosity(tf.logging.INFO)
 
-  bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
+  bert_config = modeling.BertConfig.from_json_file(os.path.expandvars(FLAGS.bert_config_file))
 
   validate_flags_or_throw(bert_config)
 
   tf.gfile.MakeDirs(FLAGS.output_dir)
 
   tokenizer = tokenization.FullTokenizer(
-      vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
+      vocab_file=os.path.expandvars(FLAGS.vocab_file), do_lower_case=FLAGS.do_lower_case)
 
   tpu_cluster_resolver = None
   if FLAGS.use_tpu and FLAGS.tpu_name:
@@ -1449,7 +1460,7 @@ def main(_):
   run_config = tf.contrib.tpu.RunConfig(
       cluster=tpu_cluster_resolver,
       master=FLAGS.master,
-      model_dir=FLAGS.output_dir,
+      model_dir=os.path.expandvars(FLAGS.output_dir),
       save_checkpoints_steps=FLAGS.save_checkpoints_steps,
       tpu_config=tf.contrib.tpu.TPUConfig(
           iterations_per_loop=FLAGS.iterations_per_loop,
@@ -1461,7 +1472,7 @@ def main(_):
   num_warmup_steps = None
   if FLAGS.do_train:
     train_examples = read_squad_examples(
-        input_file=FLAGS.train_file, input_string=None, is_training=True)
+        input_file=os.path.expandvars(FLAGS.train_file), input_string=None, is_training=True)
     num_train_steps = int(
         len(train_examples) / FLAGS.train_batch_size * FLAGS.num_train_epochs)
     num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
@@ -1473,7 +1484,7 @@ def main(_):
 
   model_fn = model_fn_builder(
       bert_config=bert_config,
-      init_checkpoint=FLAGS.init_checkpoint,
+      init_checkpoint=os.path.expandvars(FLAGS.init_checkpoint),
       learning_rate=FLAGS.learning_rate,
       num_train_steps=num_train_steps,
       num_warmup_steps=num_warmup_steps,
