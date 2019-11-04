@@ -12,7 +12,7 @@ class QAService:
 
     def _run_thread(self):
         # Initializes WebSocket for specific IP and PORT number
-        server = WebsocketServer(13254, host='127.0.0.1', loglevel=logging.INFO)
+        server = WebsocketServer(13254, host='0.0.0.0', loglevel=logging.INFO)
 
         # assigns new_client callback function
         server.set_fn_new_client(self.new_client)
